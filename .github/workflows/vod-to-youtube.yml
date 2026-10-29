@@ -1,0 +1,134 @@
+name: Archive Twitch VODs to YouTube
+
+on:
+  schedule:
+    # Every 3 hours. Also keeps the repo "active" so GitHub does not disable
+    # scheduled workflows on public repos after 60 days of quiet.
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+
+# The manifest is committed back after each run, so runs must not overlap.
+concurrency:
+  group: vod-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+      actions: write   # so a run can re-trigger itself while a backlog remains
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The branch HEAD at the moment this step runs, NOT the commit that existed when
+          # the run was queued. Runs now last hours, longer than the 3h cron, so a run can
+          # sit queued behind an earlier one; checking out its stale creation-time commit
+          # would hand it an OLD manifest and make it re-upload everything the earlier run
+          # just archived.
+          ref: main
+
+      - name: Free up runner disk
+        # A default runner has ~14 GB free; VODs are routinely bigger than that.
+        # Dropping the preinstalled toolchains gets it to roughly 40 GB.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install ffmpeg
+        # NOT preinstalled on GitHub's ubuntu runners (the 2026-09 run logs never mention
+        # it). Without it, time-sliced downloads - the only way to fit a 10h+ VOD on a
+        # ~36 GB runner - cannot run, and yt-dlp merely WARNS (hidden by --no-warnings)
+        # that it skipped its container fix-up. ffprobe (same package) is used to reject
+        # truncated or empty downloads before they are uploaded.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: Archive
+        id: archive
+        env:
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+          TWITCH_CHANNEL: ${{ secrets.TWITCH_CHANNEL }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          NOTIFY_WORKER_URL: ${{ secrets.NOTIFY_WORKER_URL }}
+          NOTIFY_WEBHOOK_TOKEN: ${{ secrets.NOTIFY_WEBHOOK_TOKEN }}
+          ARCHIVE_LANE: ${{ vars.ARCHIVE_LANE }}
+        run: python sync.py
+
+      - name: Commit manifest
+        # Runs even if the archive step died partway, so completed uploads are
+        # never re-downloaded on the next run.
+        if: always()
+        run: |
+          git config user.name "vod-archiver-bot"
+          git config user.email "vod-archiver-bot@users.noreply.github.com"
+          if ! git diff --quiet uploaded.json; then
+            git add uploaded.json
+            git commit -m "archive: $(date -u +%Y-%m-%dT%H:%MZ)"
+            # sync.py already checkpoints after every upload; this is the fallback.
+            # Rebase first: a push from anyone else during a multi-hour run would
+            # otherwise be rejected, and that run's uploads forgotten and repeated.
+            git pull --rebase -q origin main
+            git push
+          else
+            echo "manifest unchanged"
+          fi
+
+      - name: Report Actions minutes used this month
+        # Private repos get 2,000 free minutes a month. Running out stops the
+        # archive with no error anywhere, so each lane tallies its own usage and
+        # the worker shouts in a private channel when the pair hits 90%.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKER: ${{ secrets.NOTIFY_WORKER_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.NOTIFY_WEBHOOK_TOKEN }}
+        run: |
+          set -e
+          SINCE="$(date -u +%Y-%m-01T00:00:00Z)"
+          # Sum billable Linux ms across this month's runs for this repo.
+          MS=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?created=>=$SINCE&per_page=100" \
+                 --jq '[.workflow_runs[].id] | .[]' \
+               | while read -r id; do
+                   gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/timing" --jq '.run_duration_ms // 0' 2>/dev/null || echo 0
+                 done | awk '{s+=$1} END {print s+0}')
+          MINUTES=$(awk -v ms="$MS" 'BEGIN {printf "%.0f", ms/60000}')
+          echo "This repo has used ~${MINUTES} Actions minutes since ${SINCE}"
+          if [ -n "$WORKER" ] && [ -n "$WEBHOOK_TOKEN" ]; then
+            curl -sS -X POST "$WORKER/usage" \
+              -H "Authorization: Bearer $WEBHOOK_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -d "{\"repo\":\"$GITHUB_REPOSITORY\",\"minutes\":$MINUTES}" || true
+            echo ""
+          fi
+
+      - name: Continue if a backlog remains
+        # Only re-triggers when this run actually archived something, so a
+        # persistent failure stops the chain rather than looping forever.
+        # This makes the backlog drain without depending on the cron firing.
+        if: steps.archive.outputs.continue == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Archived ${{ steps.archive.outputs.archived }} this run, ${{ steps.archive.outputs.remaining }} still to go - starting another."
+          gh workflow run vod-to-youtube.yml --repo "$GITHUB_REPOSITORY"
