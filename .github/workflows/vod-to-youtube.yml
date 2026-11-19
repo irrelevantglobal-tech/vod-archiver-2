@@ -70,6 +70,8 @@ jobs:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          KICK_SLUG: ${{ secrets.KICK_SLUG }}   # Kick VODs (19 Nov): the channel only ever comes from secrets
+          KICK_CHANNEL_ID: ${{ secrets.KICK_CHANNEL_ID }}   # the slug must BE this channel, or nothing is read
           NOTIFY_WORKER_URL: ${{ secrets.NOTIFY_WORKER_URL }}
           NOTIFY_WEBHOOK_TOKEN: ${{ secrets.NOTIFY_WEBHOOK_TOKEN }}
           ARCHIVE_LANE: ${{ vars.ARCHIVE_LANE }}
