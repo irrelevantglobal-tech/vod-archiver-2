@@ -184,83 +184,6 @@ def twitch_vods(token):
             return out
 
 
-# ------------------------------------------------------------- KICK (19 Nov 2026)
-# The channel streams on Kick now, so its finished Kick VODs are archived exactly like the Twitch ones: same playlist,
-# same "[date] title" format, PRIVATE, same slicing. Kick keeps an unverified channel's VODs only 7 days.
-# The channel comes ONLY from secrets (KICK_SLUG, and KICK_CHANNEL_ID which the slug must resolve to, or nothing is
-# read: a slug once pointed at a stranger's channel). A Kick VOD is downloaded from its own 1080p HLS media playlist
-# through the slice path below (no yt-dlp); its id is "kick:<stream start, unix s>", the id the episode lane uses.
-KICK_SLUG = os.environ.get("KICK_SLUG", "").strip()
-KICK_CHANNEL_ID = os.environ.get("KICK_CHANNEL_ID", "").strip()
-KICK_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                         "Chrome/130.0 Safari/537.36", "Accept": "application/json"}
-
-
-def _kick_get(url, as_json=True):
-    for k in range(4):
-        try:
-            r = requests.get(url, headers=KICK_UA, timeout=30)
-            r.raise_for_status()
-            return r.json() if as_json else r.text
-        except Exception:   # noqa: BLE001 - gentle retries, then raise
-            if k == 3:
-                raise
-            time.sleep(3 * (k + 1))
-
-
-def _hms(seconds):
-    s = int(seconds)
-    return f"{s // 3600}h{s % 3600 // 60}m{s % 60}s"
-
-
-def kick_rendition(master_url):
-    """(url, bytes/s) of the 1920x1080 rendition with the highest frame rate in a Kick master playlist."""
-    text = _kick_get(master_url, as_json=False)
-    base = master_url.split("?", 1)[0].rsplit("/", 1)[0] + "/"
-    lines, best = text.splitlines(), None
-    for i, l in enumerate(lines):
-        if not l.startswith("#EXT-X-STREAM-INF:"):
-            continue
-        attrs = dict(kv.split("=", 1) for kv in l.split(":", 1)[1].split(",") if "=" in kv)
-        if attrs.get("RESOLUTION") != "1920x1080":
-            continue
-        uri = next((x.strip() for x in lines[i + 1:] if x.strip() and not x.startswith("#")), "")
-        cand = (float(attrs.get("FRAME-RATE", "0") or 0), uri if uri.startswith("http") else base + uri,
-                int(attrs.get("BANDWIDTH", "0") or 0))
-        best = max(best, cand) if best else cand
-    if not best:
-        raise RuntimeError("no 1920x1080 rendition in the Kick master playlist (source quality only)")
-    return best[1], (best[2] / 8) if best[2] else FALLBACK_BYTES_PER_SEC
-
-
-def kick_vods():
-    """Finished Kick VODs of the channel, shaped like Twitch's (id, created_at, duration, title, url, ...)."""
-    if not KICK_SLUG:
-        return []
-    ch = _kick_get(f"https://kick.com/api/v2/channels/{KICK_SLUG}")
-    if KICK_CHANNEL_ID and str(ch.get("id")) != KICK_CHANNEL_ID:
-        raise RuntimeError("the KICK_SLUG secret resolves to a different Kick channel than KICK_CHANNEL_ID: nothing read")
-    out = []
-    for v in _kick_get(f"https://kick.com/api/v2/channels/{KICK_SLUG}/videos") or []:
-        if KICK_CHANNEL_ID and str(v.get("channel_id")) != KICK_CHANNEL_ID:
-            raise RuntimeError("the Kick video list has another channel's VOD in it: nothing read")
-        start = str(v.get("start_time") or v.get("created_at") or "").strip().replace(" ", "T")
-        if not start:
-            continue
-        start_dt = datetime.fromisoformat(start.split(".")[0].rstrip("Z") + "+00:00")
-        dur = float(v.get("duration") or 0) / 1000.0           # ms; 0 while live
-        uuid = (v.get("video") or {}).get("uuid") or ""
-        out.append({
-            "id": f"kick:{int(start_dt.timestamp())}", "platform": "kick",
-            "created_at": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "duration": _hms(dur),
-            "title": v.get("session_title") or "Kick stream", "game_name": ((v.get("categories") or [{}])[0] or {}).get("name", ""),
-            "url": f"https://kick.com/{KICK_SLUG}/videos/{uuid}" if uuid else f"https://kick.com/{KICK_SLUG}",
-            "status": "recording" if v.get("is_live") or not dur else "recorded",
-            "master": v.get("source") or "",
-        })
-    return out
-
-
 def parse_duration(s):
     """Twitch gives '3h21m9s'. Return seconds."""
     total, num = 0, ""
@@ -358,13 +281,6 @@ def wipe_temp():
 def probe_rate(vod):
     """Bytes per second of the best rendition, from yt-dlp's metadata (one
     request, nothing downloaded). Falls back to a pessimistic constant."""
-    if vod.get("platform") == "kick":
-        try:
-            vod["playlist"], rate = kick_rendition(vod["master"])
-            return rate * 1.05 + 350 * 1000 / 8
-        except Exception as exc:  # noqa: BLE001
-            log(f"  Kick rendition probe failed ({exc}); assuming {FALLBACK_BYTES_PER_SEC / 1e6:.1f} MB/s")
-            return FALLBACK_BYTES_PER_SEC
     try:
         res = subprocess.run(
             ["yt-dlp", "-J", "--no-warnings", "--skip-download", vod["url"]],
@@ -414,10 +330,6 @@ def plan_slices(duration_s, rate, free):
 
 def media_playlist_url(vod):
     """The media playlist of the rendition `-f best` downloads (one request, nothing downloaded)."""
-    if vod.get("platform") == "kick":
-        if not vod.get("playlist"):
-            vod["playlist"], _ = kick_rendition(vod["master"])
-        return vod["playlist"]
     res = subprocess.run(["yt-dlp", "-f", "best", "-g", "--no-warnings", vod["url"]],
                          capture_output=True, text=True, timeout=120)
     urls = [u for u in res.stdout.split() if u.startswith("http")]
@@ -504,9 +416,6 @@ def download_slice(vod, path, start, end, timeout):
 def download(vod, path, start=None, end=None, expect_bytes=None):
     """True (whole VOD) or the slice's expected seconds when it worked; False when not."""
     timeout = int(est_seconds(expect_bytes)) if expect_bytes else None
-    if start is None and vod.get("platform") == "kick":
-        # Kick: always through the segment playlist (the whole VOD = one slice covering everything)
-        start, end = 0, parse_duration(vod["duration"]) + 60
     if start is not None:
         return download_slice(vod, path, start, end, timeout)
     cmd = ["yt-dlp", "-f", "best", "--no-progress", "--no-warnings",
@@ -595,41 +504,17 @@ def _clean(text):
     return text.replace("<", "\u2039").replace(">", "\u203a")
 
 
-def archive_title(vod, part=None, parts=None):
-    label = f" (Part {part}/{parts})" if part and parts and parts > 1 else ""
-    return _clean(f"[{vod['created_at'][:10]}] {vod['title']}")[:100 - len(label)] + label
-
-
-def already_in_playlist(yt, playlist_id, title):
-    """Ask YouTube first (19 Nov): the video id if the archive playlist already holds a video with exactly this title.
-    1 unit a page. A Kick part found here is recorded instead of uploaded again."""
-    if not playlist_id:
-        return None
-    token = None
-    while True:
-        r = yt.playlistItems().list(part="snippet", playlistId=playlist_id, maxResults=50,
-                                    **({"pageToken": token} if token else {})).execute()
-        for it in r.get("items", []):
-            sn = it.get("snippet") or {}
-            if sn.get("title") == title:
-                return (sn.get("resourceId") or {}).get("videoId")
-        token = r.get("nextPageToken")
-        if not token:
-            return None
-
-
 def upload(yt, vod, path, part=None, parts=None):
     label = f" (Part {part}/{parts})" if part and parts and parts > 1 else ""
-    kick = vod.get("platform") == "kick"
     body = {
         "snippet": {
-            "title": archive_title(vod, part, parts),
+            "title": _clean(f"[{vod['created_at'][:10]}] {vod['title']}")[:100 - len(label)] + label,
             "description": _clean(
-                f"{'Kick' if kick else 'Twitch'} VOD archive.\n\n"
+                f"Twitch VOD archive.\n\n"
                 f"Streamed: {vod['created_at']}\n"
                 f"Duration: {vod['duration']}\n"
                 f"Original: {vod['url']}\n"
-                f"{'Kick' if kick else 'Twitch'} id: {vod['id']}\n"
+                f"Twitch id: {vod['id']}\n"
                 + (f"Part {part} of {parts} (too long for one file on the archive runner)\n" if label else "")
             )[:5000],
             # 20 = Gaming. Avoids YouTube guessing.
@@ -716,13 +601,6 @@ def main():
     done_ids = completed_ids(done)
 
     vods = twitch_vods(twitch_token())
-    try:
-        kv = kick_vods()
-        if kv:
-            log(f"{len(kv)} Kick VOD(s) listed")
-        vods += kv
-    except Exception as exc:  # noqa: BLE001 - Kick trouble must never stop the Twitch archive (and vice versa below)
-        log(f"Kick list failed, Kick skipped this run: {type(exc).__name__}: {str(exc)[:200]}")
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=MIN_AGE_MINUTES)
 
     pending = []
@@ -819,22 +697,9 @@ def main():
                     log(f"  slice {idx}/{len(parts)} no longer fits ({free_bytes() / 1e9:.1f} GB free); next run")
                     break
 
-                path = os.path.join(HERE, f"_tmp_{v['id'].replace(':', '_')}.mp4")
+                path = os.path.join(HERE, f"_tmp_{v['id']}.mp4")
                 if multi:
                     log(f"  -- part {idx}/{len(parts)}  {a / 3600:.2f}h -> {b / 3600:.2f}h")
-                if v.get("platform") == "kick":
-                    # ask YouTube first: a part already in the archive playlist is recorded, never uploaded twice
-                    have_vid = already_in_playlist(yt, playlist_id, archive_title(v, idx if multi else None, len(parts) if multi else None))
-                    if have_vid:
-                        log(f"  already on YouTube as {have_vid}; recorded, not uploaded again")
-                        entry = {"twitch_id": v["id"], "youtube_id": have_vid, "title": v["title"],
-                                 "archived": datetime.now(timezone.utc).isoformat(), "found": True}
-                        if multi:
-                            entry.update({"part": idx, "parts": len(parts), "chunk_s": chunk_s})
-                        done.append(entry)
-                        save_manifest(done)
-                        checkpoint_manifest()
-                        continue
                 ok = False
                 for attempt in (1, 2):
                     got = download(v, path, a, b, expect_bytes=need)
